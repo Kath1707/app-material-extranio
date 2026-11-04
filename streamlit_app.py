@@ -8,7 +8,7 @@ import os
 st.set_page_config(page_title="Control de Materiales Extraños", page_icon="🧵", layout="centered")
 
 # ---------- Configuración ----------
-LINEAS = ["Línea 1", "Línea 2", "Línea 3", "Línea 4"]  # ajustar a las líneas reales de planta
+LINEAS = ["Panadería", "Dosimetría", "Amasados", "Batidos", "Galletón", "Muffin", "Cheesecake"]
 ELEMENTOS = ["PRECINTO", "BOLSA", "CINTILLO", "ENVOLTURA", "TAPITAS", "FRASQUITOS", "OTROS"]
 TIPOS_BOLSA = ["Polietileno", "Leche", "Poligrass", "Otro"]
 
@@ -112,7 +112,7 @@ with st.form("form_materiales_extranos", clear_on_submit=False):
     st.subheader("Responsables")
     col3, col4 = st.columns(2)
     with col3:
-        ejecutor = st.text_input("Ejecutor (quién realiza la verificación)")
+        ejecutor = st.text_input("Ejecutor (operario que guarda/aparta los elementos para su conteo)")
     with col4:
         responsable_validacion = st.text_input(ETIQUETA_RESPONSABLE_VALIDACION)
 
