@@ -34,7 +34,7 @@ CARPETA_NOMBRE = "Control de materiales extraños"  # subcarpeta dentro de ROOT_
 HOJA_PLANTILLA = "Hoja 1"
 MARCADOR_PIE = "VºBº COORDINADORA DE CALIDAD"
 
-LINEAS = ["Panadería", "Dosimetría", "Amasados", "Batidos", "Galletón", "Muffin", "Cheesecake"]
+LINEAS = ["Panadería", "Dosimetría", "Amasados", "Batidos", "Galletón", "Muffin", "Cheesecake", "OTROS"]
 ELEMENTOS = ["PRECINTO", "BOLSA", "CINTILLO", "ENVOLTURA", "TAPITAS", "FRASQUITOS", "OTROS"]
 TIPOS_BOLSA = ["Polietileno", "Leche", "Poligrass", "Otro"]
 
@@ -182,6 +182,8 @@ col1, col2 = st.columns(2)
 with col1:
     fecha = st.date_input("Fecha", value=None, format="DD/MM/YYYY", key=f"fecha_{k}")
     linea = st.selectbox("Línea", LINEAS, index=None, placeholder="Seleccione la línea", key=f"linea_{k}")
+    if linea == "OTROS":
+        linea = st.text_input("Especifique la línea", key=f"linea_otros_{k}")
 with col2:
     producto = st.text_input("Producto a elaborar", key=f"producto_{k}")
     lote_juliano = st.text_input("Lote juliano", key=f"lote_{k}")
