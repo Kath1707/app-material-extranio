@@ -15,15 +15,32 @@ Desinfección de huevo:
 - Cada registro nuevo se INSERTA (nunca se sobrescribe) justo encima de la
   fila con el marcador "VºBº COORDINADORA DE CALIDAD", para no pisar el pie
   de página.
+
+OneDrive (Excel) — se activa SOLO desde los Secrets con BACKEND_MATERIAL o
+BACKEND = "onedrive" (ver MIGRACION_ONEDRIVE.md):
+- Carpeta "Calidad/Control material extranio"; libro del mes
+  "<Mes> <Año> - Material extranio.xlsx", creado solo desde la plantilla.
+- Primero llena las filas libres 5 a 16 de la hoja del día y luego inserta
+  encima de la leyenda. La foto va como miniatura en la columna K.
+
+Seguridad (la app es pública): la app solo ESCRIBE. Nunca muestra, lista ni
+descarga para el usuario nada de OneDrive/Drive, y ante un error muestra un
+mensaje genérico; el detalle técnico va solo al log.
 """
 
-import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
-from PIL import Image
-from datetime import date
-import io
 import base64
+import logging
+from datetime import date
+
+import gspread
+import streamlit as st
+from google.oauth2.service_account import Credentials
+
+import entrada
+import onedrive_client as od
+import registro_excel as rx
+
+log = logging.getLogger("material_extranio")
 
 st.set_page_config(page_title="Control de Materiales Extraños", page_icon="🧵", layout="centered")
 
@@ -38,14 +55,17 @@ LINEAS = ["Panadería", "Dosimetría", "Amasados", "Batidos", "Galletón", "Muff
 ELEMENTOS = ["PRECINTO", "BOLSA", "CINTILLO", "ENVOLTURA", "TAPITAS", "FRASQUITOS", "OTROS"]
 TIPOS_BOLSA = ["Polietileno", "Leche", "Poligrass", "Otro"]
 
-# Límite de Google Sheets: 50,000 caracteres por celda. Una miniatura comprimida
+# Solo Google: límite de 50,000 caracteres por celda. Una miniatura comprimida
 # a este tamaño/calidad entra holgadamente dentro de ese límite.
 MAX_THUMBNAIL_SIDE = 300
 JPEG_QUALITY = 50
 
 ETIQUETA_RESPONSABLE_VALIDACION = "Responsable que valida el registro"  # cambiar aquí si prefieres otra palabra
 
-# Mismo orden que los encabezados de la plantilla en Google Sheets.
+# Mismo orden que los encabezados (fila 4, A:M) de la plantilla:
+# FECHA | LÍNEA | PRODUCTO | LOTE JULIANO | CANT. BATCH | ELEMENTO CONTROLADO |
+# ESPECIFICACIÓN / DETALLE | CANT. ELEMENTOS CONTROLADOS | CONFORMIDAD |
+# OBSERVACIONES | FOTO (miniatura) | EJECUTOR | RESPONSABLE DE VALIDACIÓN
 COLUMNS = [
     "FECHA", "LINEA", "PRODUCTO", "LOTE_JULIANO", "CANTIDAD_BATCH",
     "ELEMENTO", "ESPECIFICACION", "CANTIDAD_CONTROLADA", "CONFORMIDAD",
@@ -147,12 +167,11 @@ def encontrar_fila_marcador(worksheet):
     )
 
 
-def comprimir_imagen_a_base64(uploaded_file) -> str:
-    img = Image.open(uploaded_file).convert("RGB")
-    img.thumbnail((MAX_THUMBNAIL_SIDE, MAX_THUMBNAIL_SIDE))
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=JPEG_QUALITY)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+def comprimir_imagen_a_base64(datos_foto: bytes) -> str:
+    miniatura = entrada.miniatura_jpeg(
+        datos_foto, (MAX_THUMBNAIL_SIDE, MAX_THUMBNAIL_SIDE), JPEG_QUALITY
+    )
+    return base64.b64encode(miniatura).decode("utf-8")
 
 
 def guardar_filas(worksheet, filas_valores, fila_destino):
@@ -160,6 +179,35 @@ def guardar_filas(worksheet, filas_valores, fila_destino):
     manteniendo el orden de los elementos marcados."""
     for i, valores in enumerate(filas_valores):
         worksheet.insert_row(valores, index=fila_destino + i, value_input_option="USER_ENTERED")
+
+
+def guardar_en_google(fecha: date, filas_valores: list) -> None:
+    gc = conectar_gspread()
+    root_folder_id = st.secrets["ROOT_FOLDER_ID"]
+    carpeta_id = obtener_carpeta_id(gc, CARPETA_NOMBRE, root_folder_id)
+    spreadsheet = obtener_spreadsheet_mensual(gc, carpeta_id, nombre_spreadsheet_mensual(fecha))
+    worksheet = obtener_o_crear_hoja_del_dia(spreadsheet, fecha)
+    fila_destino = encontrar_fila_marcador(worksheet)
+    guardar_filas(worksheet, filas_valores, fila_destino)
+
+
+def guardar_en_onedrive(fecha: date, filas_valores: list, miniatura: bytes | None) -> None:
+    """Una sola descarga/subida del libro del mes para todos los elementos marcados.
+    La miniatura (si hay) se ancla en la columna K de cada fila del registro."""
+    imagenes = [{rx.COLUMNA_FOTO_MATERIAL: miniatura} if miniatura else None for _ in filas_valores]
+    rx.guardar_filas_con_firma(
+        rx.MATERIAL, fecha, fecha.strftime("%Y-%m-%d"), filas_valores, imagenes=imagenes
+    )
+
+
+MENSAJE_ERROR_GENERICO = (
+    "No se pudo guardar el registro. Inténtalo de nuevo en unos minutos; "
+    "si el problema continúa, avisa al área de Calidad."
+)
+MENSAJE_ARCHIVO_OCUPADO = (
+    "No se pudo guardar porque el registro del mes está siendo usado en este momento. "
+    "Espera un minuto e inténtalo de nuevo (no se perdió nada de lo ya guardado)."
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -172,6 +220,9 @@ st.caption(
     "para evitar la presencia de materiales extraños en el producto terminado."
 )
 
+LARGO = entrada.LARGO_MAXIMO
+MAX_CANTIDAD = 100_000
+
 if "form_key" not in st.session_state:
     st.session_state.form_key = 0
 
@@ -183,12 +234,16 @@ with col1:
     fecha = st.date_input("Fecha", value=None, format="DD/MM/YYYY", key=f"fecha_{k}")
     linea = st.selectbox("Línea", LINEAS, index=None, placeholder="Seleccione la línea", key=f"linea_{k}")
     if linea == "OTROS":
-        linea = st.text_input("Especifique la línea", key=f"linea_otros_{k}")
+        linea = st.text_input(
+            "Especifique la línea", max_chars=LARGO["linea"], key=f"linea_otros_{k}"
+        )
 with col2:
-    producto = st.text_input("Producto a elaborar", key=f"producto_{k}")
-    lote_juliano = st.text_input("Lote juliano", key=f"lote_{k}")
+    producto = st.text_input("Producto a elaborar", max_chars=LARGO["producto"], key=f"producto_{k}")
+    lote_juliano = st.text_input("Lote juliano", max_chars=LARGO["lote"], key=f"lote_{k}")
 
-cantidad_batch = st.number_input("Cantidad de batch elaborados", min_value=0, step=1, key=f"batch_{k}")
+cantidad_batch = st.number_input(
+    "Cantidad de batch elaborados", min_value=0, max_value=MAX_CANTIDAD, step=1, key=f"batch_{k}"
+)
 
 st.divider()
 st.subheader("Elementos a controlar")
@@ -205,15 +260,21 @@ for elemento in ELEMENTOS:
                     "Especifique el tipo de bolsa", TIPOS_BOLSA, key=f"tipo_{elemento}_{k}"
                 )
                 if tipo_bolsa == "Otro":
-                    especificacion = st.text_input("Detalle el tipo de bolsa", key=f"detalle_{elemento}_{k}")
+                    especificacion = st.text_input(
+                        "Detalle el tipo de bolsa", max_chars=LARGO["especificacion"],
+                        key=f"detalle_{elemento}_{k}",
+                    )
                 else:
                     especificacion = tipo_bolsa
             elif elemento == "OTROS":
-                especificacion = st.text_input("Especifique el elemento", key=f"detalle_{elemento}_{k}")
+                especificacion = st.text_input(
+                    "Especifique el elemento", max_chars=LARGO["especificacion"],
+                    key=f"detalle_{elemento}_{k}",
+                )
 
             cantidad_controlada = st.number_input(
                 f"Cantidad de {elemento.lower()} controlados",
-                min_value=0, step=1, key=f"cantidad_{elemento}_{k}",
+                min_value=0, max_value=MAX_CANTIDAD, step=1, key=f"cantidad_{elemento}_{k}",
             )
 
             confirmacion = st.radio(
@@ -222,7 +283,7 @@ for elemento in ELEMENTOS:
             )
 
             datos_elementos[elemento] = {
-                "especificacion": especificacion,
+                "especificacion": entrada.limpiar_texto(especificacion, LARGO["especificacion"]),
                 "cantidad_controlada": cantidad_controlada,
                 "confirmacion": confirmacion,
             }
@@ -232,20 +293,38 @@ st.subheader("Responsables")
 col3, col4 = st.columns(2)
 with col3:
     ejecutor = st.text_input(
-        "Ejecutor (operario que guarda/aparta los elementos para su conteo)", key=f"ejecutor_{k}"
+        "Ejecutor (operario que guarda/aparta los elementos para su conteo)",
+        max_chars=LARGO["persona"], key=f"ejecutor_{k}",
     )
 with col4:
-    responsable_validacion = st.text_input(ETIQUETA_RESPONSABLE_VALIDACION, key=f"responsable_{k}")
+    responsable_validacion = st.text_input(
+        ETIQUETA_RESPONSABLE_VALIDACION, max_chars=LARGO["persona"], key=f"responsable_{k}"
+    )
 
 st.divider()
-observaciones = st.text_area("Observaciones (opcional)", key=f"obs_{k}")
-foto = st.file_uploader("Foto de evidencia (opcional)", type=["jpg", "jpeg", "png"], key=f"foto_{k}")
+observaciones = st.text_area(
+    "Observaciones (opcional)", max_chars=LARGO["observaciones"], key=f"obs_{k}"
+)
+foto = st.file_uploader(
+    "Foto de evidencia (opcional, JPG o PNG de hasta 5 MB)",
+    type=["jpg", "jpeg", "png"], key=f"foto_{k}",
+)
+
+# Todo lo escrito pasa por aquí antes de validarse y guardarse (largo máximo,
+# sin caracteres de control). El widget ya limita el largo; esto es la defensa
+# del lado del servidor.
+linea = entrada.limpiar_texto(linea, LARGO["linea"])
+producto = entrada.limpiar_texto(producto, LARGO["producto"])
+lote_juliano = entrada.limpiar_texto(lote_juliano, LARGO["lote"])
+ejecutor = entrada.limpiar_texto(ejecutor, LARGO["persona"])
+responsable_validacion = entrada.limpiar_texto(responsable_validacion, LARGO["persona"])
+observaciones = entrada.limpiar_texto(observaciones, LARGO["observaciones"], multilinea=True)
 
 st.divider()
 col_guardar, col_nuevo = st.columns(2)
 
 with col_guardar:
-    if st.button("💾 Registrar control", type="primary", use_container_width=True):
+    if st.button("💾 Registrar control", type="primary", use_container_width=True, key="registrar"):
         errores = []
         if fecha is None:
             errores.append("Seleccione la fecha.")
@@ -257,9 +336,9 @@ with col_guardar:
             errores.append("Ingrese el lote juliano.")
         if not datos_elementos:
             errores.append("Marque al menos un elemento a controlar.")
-        if not ejecutor.strip():
+        if not ejecutor:
             errores.append("Ingrese el ejecutor.")
-        if not responsable_validacion.strip():
+        if not responsable_validacion:
             errores.append(f"Ingrese el {ETIQUETA_RESPONSABLE_VALIDACION.lower()}.")
         for elemento, datos in datos_elementos.items():
             if datos["confirmacion"] is None:
@@ -267,11 +346,22 @@ with col_guardar:
             if elemento in ("BOLSA", "OTROS") and not datos["especificacion"]:
                 errores.append(f"Especifique el detalle de {elemento}.")
 
+        usar_onedrive = od.activo("material")
+        foto_b64, miniatura = "", None
+        if not errores and foto is not None:
+            try:
+                datos_foto = foto.getvalue()
+                if usar_onedrive:
+                    miniatura = entrada.miniatura_para_excel(datos_foto)
+                else:
+                    foto_b64 = comprimir_imagen_a_base64(datos_foto)
+            except entrada.FotoInvalida as e:
+                errores.append(str(e))
+
         if errores:
             for e in errores:
                 st.error(e)
         else:
-            foto_b64 = comprimir_imagen_a_base64(foto) if foto is not None else ""
 
             filas = []
             for elemento, datos in datos_elementos.items():
@@ -287,32 +377,31 @@ with col_guardar:
                     "CONFORMIDAD": "Conforme" if datos["confirmacion"] == "Sí" else "No conforme",
                     "OBSERVACIONES": observaciones,
                     "FOTO_BASE64": foto_b64,
-                    "EJECUTOR": ejecutor.strip(),
-                    "RESPONSABLE_VALIDACION": responsable_validacion.strip(),
+                    "EJECUTOR": ejecutor,
+                    "RESPONSABLE_VALIDACION": responsable_validacion,
                 })
+            filas_valores = [[fila[col] for col in COLUMNS] for fila in filas]
 
             try:
-                with st.spinner("Guardando en Google Sheets..."):
-                    gc = conectar_gspread()
-                    root_folder_id = st.secrets["ROOT_FOLDER_ID"]
-                    carpeta_id = obtener_carpeta_id(gc, CARPETA_NOMBRE, root_folder_id)
-                    nombre_ss = nombre_spreadsheet_mensual(fecha)
-                    spreadsheet = obtener_spreadsheet_mensual(gc, carpeta_id, nombre_ss)
-                    worksheet = obtener_o_crear_hoja_del_dia(spreadsheet, fecha)
-                    fila_destino = encontrar_fila_marcador(worksheet)
-                    filas_valores = [[fila[col] for col in COLUMNS] for fila in filas]
-                    guardar_filas(worksheet, filas_valores, fila_destino)
-
+                with st.spinner("Guardando el registro..."):
+                    if usar_onedrive:
+                        guardar_en_onedrive(fecha, filas_valores, miniatura)
+                    else:
+                        guardar_en_google(fecha, filas_valores)
+            except od.ArchivoOcupado:
+                log.warning("Libro del mes ocupado al guardar material extraño", exc_info=True)
+                st.error(MENSAJE_ARCHIVO_OCUPADO)
+            except Exception:
+                # El detalle (rutas, nombres de archivo, respuesta de Microsoft/Google)
+                # va SOLO al log de Streamlit Cloud; nunca a la pantalla.
+                log.exception("Error al guardar el control de materiales extraños")
+                st.error(MENSAJE_ERROR_GENERICO)
+            else:
                 st.success(
-                    f"Se registraron {len(filas)} elemento(s) en '{nombre_ss}' → "
-                    f"hoja '{fecha.strftime('%Y-%m-%d')}'."
+                    f"Se registraron {len(filas)} elemento(s) del {fecha.strftime('%d/%m/%Y')}."
                 )
                 if foto is not None:
                     st.image(foto, caption="Vista previa de la foto adjuntada", width=200)
-            except FileNotFoundError as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"Ocurrió un error al guardar: {e}")
 
 with col_nuevo:
     if st.button("➕ Nuevo registro", use_container_width=True):
