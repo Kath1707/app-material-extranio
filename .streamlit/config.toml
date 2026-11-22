@@ -1,0 +1,3 @@
+[server]
+# Tamaño máximo de archivo subido (MB). La app pública solo acepta fotos de hasta 5 MB.
+maxUploadSize = 5
